@@ -24,16 +24,25 @@ if command -v apt-get >/dev/null; then
         else
             WEBKIT=(gir1.2-webkit2-4.0)
         fi
-        sudo apt-get install -y python3 python3-gi python3-gi-cairo python3-venv gir1.2-gtk-3.0 "${WEBKIT[@]}" || echo 'Dependências GTK indisponíveis; será usado o navegador.' >&2
+        MISSING=()
+        for package in python3-gi python3-pip "${WEBKIT[@]}"; do
+            if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != 'install ok installed' ]]; then
+                MISSING+=("$package")
+            fi
+        done
+        if ((${#MISSING[@]})); then
+            sudo apt-get install -y --no-install-recommends "${MISSING[@]}" || echo 'Dependências GTK indisponíveis; será usado o navegador.' >&2
+        fi
     else
         echo 'Não foi possível atualizar o apt; a continuar com as dependências existentes.' >&2
     fi
     PYTHON=/usr/bin/python3
 fi
-if as_user "$PYTHON" -m venv --system-site-packages "$APP_DIR/.venv" &&
-   as_user "$APP_DIR/.venv/bin/python" -m pip install --upgrade 'pywebview>=6.2,<7'; then
-    PYTHON="$APP_DIR/.venv/bin/python"
-else
+PIP_FLAGS=()
+if [[ "$("$PYTHON" -m pip install --help 2>/dev/null)" == *--break-system-packages* ]]; then
+    PIP_FLAGS=(--break-system-packages)
+fi
+if ! as_user env PYTHONWARNINGS=ignore::SyntaxWarning PYTHONDONTWRITEBYTECODE=1 "$PYTHON" -m pip install --user --upgrade --no-compile "${PIP_FLAGS[@]}" 'pywebview==6.2.1'; then
     echo 'pywebview recente indisponível; a aplicação pode usar --browser.' >&2
 fi
 if ! command -v visudo >/dev/null; then
@@ -45,23 +54,33 @@ sudo install -o root -g root -m 755 "$APP_DIR/cp-coach-hosts-helper" /usr/local/
 RULE="$(mktemp)"
 trap 'rm -f -- "$RULE"' EXIT
 printf '%s ALL=(root) NOPASSWD: /usr/local/lib/cp-coach/cp-coach-hosts-helper apply, /usr/local/lib/cp-coach/cp-coach-hosts-helper remove, /usr/local/lib/cp-coach/cp-coach-hosts-helper status\n' "$INSTALL_USER" > "$RULE"
-sudo visudo -cf "$RULE"
+if ! sudo visudo -qcf "$RULE"; then
+    echo 'Falha: regra sudo inválida; não foi instalada.' >&2
+    exit 1
+fi
 sudo install -o root -g root -m 440 "$RULE" /etc/sudoers.d/cp-coach
-sudo visudo -cf /etc/sudoers.d/cp-coach
+if ! sudo visudo -qcf /etc/sudoers.d/cp-coach; then
+    echo 'Falha: a regra sudo instalada não passou a validação. Verifique /etc/sudoers.d/cp-coach.' >&2
+    exit 1
+fi
 as_user "$PYTHON" - "$APP_DIR" "$USER_HOME" "$PYTHON" <<'PY'
 from pathlib import Path
 import sys
 app, home, python = sys.argv[1:]
 def quoted(value):
     return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$').replace('%', '%%') + '"'
-icons = Path(home) / '.local/share/icons/hicolor/scalable/apps'
-icons.mkdir(parents=True, exist_ok=True)
-(icons / 'cp-coach.svg').write_bytes((Path(app) / 'cp-coach.svg').read_bytes())
-(icons / 'cp-coach.svg').chmod(0o644)
 destination = Path(home) / '.local/share/applications'
 destination.mkdir(parents=True, exist_ok=True)
 desktop = destination / 'cp-coach.desktop'
 desktop.write_text('[Desktop Entry]\nType=Application\nName=CP Coach\nComment=CP Tools e controlo local de IA\nExec=' + quoted(python) + ' ' + quoted(str(Path(app) / 'cp-coach.py')) + '\nIcon=cp-coach\nStartupWMClass=cp-coach\nTerminal=false\nCategories=Education;Development;\n', encoding='utf-8')
 desktop.chmod(0o644)
+import shutil
+for size, name in [('scalable', 'cp-coach.svg'), ('256x256', 'cp-coach.png')]:
+    icons = Path(home) / '.local/share/icons/hicolor' / size / 'apps'
+    icons.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(Path(app) / name, icons / name)
 PY
+if command -v gtk-update-icon-cache >/dev/null; then
+    as_user gtk-update-icon-cache -f -t "$USER_HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
+fi
 echo "Instalação concluída. Abra CP Coach no menu ou execute: $PYTHON \"$APP_DIR/cp-coach.py\""

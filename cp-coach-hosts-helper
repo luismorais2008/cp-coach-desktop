@@ -11,8 +11,16 @@ BEGIN = '# BEGIN cp-coach'
 END = '# END cp-coach'
 DOMAINS = '''chatgpt.com chat.openai.com openai.com api.openai.com claude.ai anthropic.com gemini.google.com bard.google.com aistudio.google.com copilot.microsoft.com perplexity.ai chat.deepseek.com deepseek.com poe.com grok.com x.ai meta.ai chat.mistral.ai huggingface.co phind.com you.com character.ai api.githubcopilot.com copilot-proxy.githubusercontent.com codeium.com windsurf.com cursor.com cursor.sh tabnine.com blackbox.ai'''.split()
 DOMAINS += '''api.anthropic.com console.anthropic.com statsig.anthropic.com claude.com devin.ai app.devin.ai api.devin.ai cognition.ai server.codeium.com inference.codeium.com generativelanguage.googleapis.com cloudcode-pa.googleapis.com api.deepseek.com api.mistral.ai api.x.ai api.groq.com groq.com openrouter.ai api.together.xyz together.ai ollama.com api.individual.githubcopilot.com api.business.githubcopilot.com api.enterprise.githubcopilot.com copilot-telemetry.githubusercontent.com api2.cursor.sh api.cursor.com ampcode.com opencode.ai api.moonshot.ai dashscope.aliyuncs.com'''.split()
-DOMAINS = sorted(set(DOMAINS + ['www.' + d for d in DOMAINS]))
+DOMAINS += '''z.ai chat.z.ai chatglm.cn kimi.com kimi.moonshot.cn chat.qwen.ai qwen.ai tongyi.aliyun.com doubao.com yiyan.baidu.com pi.ai lmarena.ai chat.lmsys.org genspark.ai manus.im notebooklm.google.com t3.chat monica.im duck.ai felo.ai chat.minimax.io hailuoai.com'''.split()
+AI_DOMAINS = sorted(set(DOMAINS + ['www.' + d for d in DOMAINS]))
+NON_CHAT_HOSTS = {'openai.com', 'www.openai.com', 'anthropic.com', 'www.anthropic.com',
+                  'api-docs.deepseek.com', 'platform.deepseek.com', 'help.openai.com',
+                  'auth.openai.com', 'auth0.openai.com', 'status.openai.com',
+                  'docs.anthropic.com', 'support.anthropic.com', 'status.anthropic.com',
+                  'docs.github.com', 'platform.openai.com'}
+DOMAINS = [domain for domain in AI_DOMAINS if domain not in NON_CHAT_HOSTS]
 BLOCK = BEGIN + '\n' + ''.join(f'{ip} {d}\n' for d in DOMAINS for ip in ('0.0.0.0', '::')) + END + '\n'
+ENTRIES = {f'{ip} {domain}' for domain in AI_DOMAINS for ip in ('0.0.0.0', '::')}
 
 
 def stripped(contents):
@@ -20,17 +28,11 @@ def stripped(contents):
     result, inside = [], False
     for line in lines:
         if line.strip() == BEGIN:
-            if inside:
-                raise ValueError('Marcadores duplicados')
             inside = True
         elif line.strip() == END:
-            if not inside:
-                raise ValueError('Marcador final sem início')
             inside = False
-        elif not inside:
+        elif not inside or line.strip() not in ENTRIES:
             result.append(line)
-    if inside:
-        raise ValueError('Bloco incompleto; reparar /etc/hosts manualmente')
     return ''.join(result)
 
 
@@ -44,8 +46,15 @@ def main():
         return
     if os.geteuid() != 0:
         raise PermissionError('São necessários privilégios de administrador')
-    with open('/run/lock/cp-coach-hosts.lock', 'a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    fd = os.open('/run/cp-coach-hosts.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(fd, 'r+') as lock:
+        lock_info = os.fstat(lock.fileno())
+        if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != 0 or lock_info.st_mode & 0o022:
+            raise ValueError('Ficheiro de bloqueio inseguro em /run/cp-coach-hosts.lock')
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('Outra operação CP Coach está em curso; tente novamente.') from None
         info = os.lstat('/etc/hosts')
         if not stat.S_ISREG(info.st_mode):
             raise ValueError('/etc/hosts não é um ficheiro regular')

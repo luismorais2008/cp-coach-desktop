@@ -15,19 +15,20 @@ import tempfile
 import threading
 import time
 import uuid
+import warnings
 import webbrowser
 from urllib.parse import urlsplit
 from http.server import ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parent
-ICON = ROOT / 'cp-coach.svg'
 spec = importlib.util.spec_from_file_location('cp_tools_server', ROOT / 'cp-tools-server.py')
 server = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(server)
 helper_spec = importlib.util.spec_from_loader('hosts_helper', __import__('importlib.machinery', fromlist=['SourceFileLoader']).SourceFileLoader('hosts_helper', str(ROOT / 'cp-coach-hosts-helper')))
 helper = importlib.util.module_from_spec(helper_spec)
 helper_spec.loader.exec_module(helper)
-DOMAINS = set(helper.DOMAINS)
+DOMAINS = set(helper.AI_DOMAINS)
+NON_CHAT_HOSTS = helper.NON_CHAT_HOSTS - {'platform.deepseek.com', 'platform.openai.com'}
 INSTALLED_HELPER = '/usr/local/lib/cp-coach/cp-coach-hosts-helper'
 AGENT_NAMES = set('claude devin codex gemini aider aider-chat copilot opencode cursor-agent goose crush amp qwen qwen-code llm ollama chatgpt lm-studio cursor windsurf jan'.split()) | {'lm studio'}
 AGENT_PACKAGES = {('@anthropic-ai', 'claude-code'), ('@openai', 'codex'),
@@ -84,10 +85,37 @@ def process_info(path):
 
 def ai_url(url):
     try:
-        host = (urlsplit(url).hostname or '').lower().rstrip('.')
+        parsed = urlsplit(url)
+        host = (parsed.hostname or '').lower().rstrip('.')
+        path = parsed.path.lower()
+        if parsed.scheme not in ('http', 'https') or host in NON_CHAT_HOSTS:
+            return False
+        if host == 'platform.deepseek.com' and any(path == prefix or path.startswith(prefix + '/') for prefix in ('/docs', '/api-docs', '/documentation')):
+            return False
+        if host == 'platform.openai.com':
+            return path == '/playground' or path.startswith('/playground/')
+        if host.endswith(('.openai.com', '.anthropic.com')):
+            return any(host == domain or host.endswith('.' + domain) for domain in ('chat.openai.com', 'api.openai.com', 'api.anthropic.com', 'console.anthropic.com'))
         return any(host == domain or host.endswith('.' + domain) for domain in DOMAINS)
     except ValueError:
         return False
+
+
+def history_domain(url):
+    host = (urlsplit(url).hostname or '').lower().rstrip('.')
+    labels = host.split('.')
+    suffix = '.'.join(labels[-2:])
+    if suffix in ('co.uk', 'com.cn', 'com.au', 'co.jp', 'com.br', 'com.hk', 'com.tw', 'co.in'):
+        return '.'.join(labels[-3:])
+    return suffix
+
+
+def browser_family(browser):
+    value = browser.lower()
+    for token, name in (('firefox', 'Firefox'), ('brave', 'Brave'), ('edge', 'Edge'), ('vivaldi', 'Vivaldi'), ('opera', 'Opera'), ('google-chrome', 'Chrome'), ('chromium', 'Chromium'), ('chrome', 'Chrome')):
+        if token in value:
+            return name
+    return browser.split(':')[0]
 
 
 def history_databases():
@@ -140,6 +168,7 @@ class Blocker:
                 self.poll()
             else:
                 self.network_command('remove')
+            self.rescan_finished()
 
     def save(self):
         temporary = self.path.with_suffix('.tmp')
@@ -176,20 +205,41 @@ class Blocker:
         self.network['reason'] = '; '.join(errors) or 'Helper não instalado. Execute install.sh para ativar o bloqueio de rede.'
         return False
 
-    def violation(self, kind, key, **details):
-        session = self.state['current']
+    def violation(self, kind, key, session=None, **details):
+        session = self.state['current'] if session is None else session
         if not any(item['key'] == key for item in session['violations']):
             session['violations'].append(dict(kind=kind, key=key, time=time.time(), **details))
 
     def scan(self, end):
-        session = self.state['current']
         self.monitor_errors = []
+        self.scan_history(self.state['current'], end)
+
+    def scan_history(self, session, end):
         for path, browser in history_databases():
             try:
-                for url, timestamp in history_visits(path, session['start'], end):
-                    self.violation('histórico', f'{path}:{timestamp}:{url}', browser=browser, url=url, visit_time=timestamp)
+                for url, timestamp in sorted(history_visits(path, session['start'], end), key=lambda visit: visit[1]):
+                    domain, family = history_domain(url), browser_family(browser)
+                    duplicate = any(item['kind'] == 'histórico' and browser_family(item.get('browser', '')) == family and history_domain(item.get('url', '')) == domain and abs(item.get('visit_time', item['time']) - timestamp) < 120 for item in session['violations'])
+                    if not duplicate:
+                        self.violation('histórico', f'{path}:{timestamp}:{url}', session=session, browser=browser, domain=domain, url=url, visit_time=timestamp)
             except (OSError, sqlite3.Error) as error:
                 self.monitor_errors.append(f'{browser}: {error}')
+
+    def rescan_finished(self):
+        now, changed = time.time(), False
+        for session in self.state['sessions']:
+            if session.get('end') is None:
+                continue
+            if 'history_rescans' not in session:
+                session['history_rescans'] = [session['end'] + 15, session['end'] + 60]
+                changed = True
+            if any(deadline <= now for deadline in session['history_rescans']):
+                self.scan_history(session, session['end'])
+                session['history_rescans'] = [deadline for deadline in session['history_rescans'] if deadline > now]
+                changed = True
+        if changed:
+            self.save()
+
     def signal_process(self, info, sig):
         path = Path('/proc') / str(info['pid'])
         current = process_info(path)
@@ -254,6 +304,7 @@ class Blocker:
         end = min(time.time(), session.get('deadline') or time.time())
         self.scan(end)
         session['end'] = end
+        session['history_rescans'] = [end + 15, end + 60]
         self.state['sessions'].append(session)
         self.state['current'] = None
         self.pending_processes.clear()
@@ -268,7 +319,10 @@ class Blocker:
             if session.get('deadline') and time.time() >= session['deadline']:
                 self.finish()
                 return
-            if not self.network_command('status'):
+            if not Path(INSTALLED_HELPER).is_file():
+                self.network_command('status')
+                self.network['reason'] = 'Helper não instalado; bloqueio de rede indisponível. Execute install.sh.'
+            elif not self.network_command('status'):
                 self.violation('bloqueio', 'tamper:' + str(int(time.time() // 30)), message='Bloco de rede ausente; tentativa de reposição.')
                 self.network_command('apply')
             self.scan(time.time())
@@ -285,6 +339,7 @@ class Blocker:
                             self.poll()
                         self.scan_processes()
                         self.save()
+                    self.rescan_finished()
             except Exception as error:
                 self.monitor_errors = [str(error)]
 
@@ -339,10 +394,8 @@ class Handler(server.Handler):
         path = self.path.split('?')[0]
         if path == '/blocker/status':
             return self.send(200, json.dumps(self.blocker.status(), ensure_ascii=False).encode())
-        if path == '/icon.svg':
-            return self.send(200, ICON.read_bytes(), 'image/svg+xml')
         if path in ('/', '/cp-tools.html'):
-            page = Path(server.PAGE).read_text().replace('</head>', '<link rel="icon" type="image/svg+xml" href="/icon.svg"></head>', 1)
+            page = Path(server.PAGE).read_text()
             return self.send(200, page.replace('</body>', PANEL + '</body>').encode(), 'text/html; charset=utf-8')
         super().do_GET()
 
@@ -371,27 +424,21 @@ def browser_window(url):
     for name in ('chromium', 'chromium-browser', 'google-chrome', 'brave-browser', 'brave'):
         executable = shutil.which(name)
         if executable:
-            subprocess.Popen([executable, '--app=' + url, '--class=cp-coach'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen([executable, '--app=' + url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return
     webbrowser.open(url)
 
 
 def native_window(url):
-    try:
-        from gi.repository import GLib
-        GLib.set_prgname('cp-coach')
-    except ImportError:
-        pass
-    try:
-        from qtpy.QtGui import QGuiApplication
-        QGuiApplication.setDesktopFileName('cp-coach')
-    except ImportError:
-        pass
+    warnings.filterwarnings('ignore', category=SyntaxWarning, module=r'webview(\..*)?')
     import webview
+    from gi.repository import GLib
+    GLib.set_prgname('cp-coach')
+    GLib.set_application_name('CP Coach')
     storage = Path.home() / '.local/share/cp-coach/webview'
     storage.mkdir(parents=True, exist_ok=True, mode=0o700)
     webview.create_window('CP Coach — CP Tools', url, width=1280, height=900)
-    webview.start(private_mode=False, storage_path=str(storage), icon=str(ICON))
+    webview.start(gui='gtk', private_mode=False, storage_path=str(storage), icon=str(ROOT / 'cp-coach.png'))
 
 
 def main():
@@ -400,10 +447,6 @@ def main():
     parser.add_argument('--serve-only', action='store_true')
     parser.add_argument('--port', type=int, default=0)
     args = parser.parse_args()
-    venv = ROOT / '.venv'
-    if not args.browser and not args.serve_only and (venv / 'bin/python').exists() and Path(sys.prefix).resolve() != venv.resolve():
-        python = str(venv / 'bin/python')
-        os.execv(python, [python, str(ROOT / 'cp-coach.py'), *sys.argv[1:]])
     blocker = Blocker()
     Handler.blocker = blocker
     httpd = ThreadingHTTPServer(('127.0.0.1', args.port), Handler)
