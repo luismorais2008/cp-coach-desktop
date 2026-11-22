@@ -1,0 +1,77 @@
+#!/usr/bin/python3 -I
+"""Restricted privileged hosts editor. Install root-owned before granting sudo access."""
+import fcntl
+import json
+import os
+import stat
+import sys
+import tempfile
+
+BEGIN = '# BEGIN cp-coach'
+END = '# END cp-coach'
+DOMAINS = '''chatgpt.com chat.openai.com openai.com api.openai.com claude.ai anthropic.com gemini.google.com bard.google.com aistudio.google.com copilot.microsoft.com perplexity.ai chat.deepseek.com deepseek.com poe.com grok.com x.ai meta.ai chat.mistral.ai huggingface.co phind.com you.com character.ai api.githubcopilot.com copilot-proxy.githubusercontent.com codeium.com windsurf.com cursor.com cursor.sh tabnine.com blackbox.ai'''.split()
+DOMAINS += '''api.anthropic.com console.anthropic.com statsig.anthropic.com claude.com devin.ai app.devin.ai api.devin.ai cognition.ai server.codeium.com inference.codeium.com generativelanguage.googleapis.com cloudcode-pa.googleapis.com api.deepseek.com api.mistral.ai api.x.ai api.groq.com groq.com openrouter.ai api.together.xyz together.ai ollama.com api.individual.githubcopilot.com api.business.githubcopilot.com api.enterprise.githubcopilot.com copilot-telemetry.githubusercontent.com api2.cursor.sh api.cursor.com ampcode.com opencode.ai api.moonshot.ai dashscope.aliyuncs.com'''.split()
+DOMAINS = sorted(set(DOMAINS + ['www.' + d for d in DOMAINS]))
+BLOCK = BEGIN + '\n' + ''.join(f'{ip} {d}\n' for d in DOMAINS for ip in ('0.0.0.0', '::')) + END + '\n'
+
+
+def stripped(contents):
+    lines = contents.splitlines(keepends=True)
+    result, inside = [], False
+    for line in lines:
+        if line.strip() == BEGIN:
+            if inside:
+                raise ValueError('Marcadores duplicados')
+            inside = True
+        elif line.strip() == END:
+            if not inside:
+                raise ValueError('Marcador final sem início')
+            inside = False
+        elif not inside:
+            result.append(line)
+    if inside:
+        raise ValueError('Bloco incompleto; reparar /etc/hosts manualmente')
+    return ''.join(result)
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ('apply', 'remove', 'status'):
+        raise ValueError('Uso: cp-coach-hosts-helper apply|remove|status')
+    action = sys.argv[1]
+    if action == 'status':
+        with open('/etc/hosts') as source:
+            print(json.dumps({'active': BLOCK in source.read()}))
+        return
+    if os.geteuid() != 0:
+        raise PermissionError('São necessários privilégios de administrador')
+    with open('/run/lock/cp-coach-hosts.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        info = os.lstat('/etc/hosts')
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError('/etc/hosts não é um ficheiro regular')
+        with open('/etc/hosts') as source:
+            original = source.read()
+        body = stripped(original)
+        if action == 'apply':
+            body = body.rstrip('\n') + '\n' + BLOCK
+        fd, name = tempfile.mkstemp(prefix='.cp-coach-', dir='/etc')
+        try:
+            with os.fdopen(fd, 'w') as target:
+                os.fchmod(target.fileno(), stat.S_IMODE(info.st_mode))
+                os.fchown(target.fileno(), info.st_uid, info.st_gid)
+                target.write(body)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(name, '/etc/hosts')
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+        print(json.dumps({'active': action == 'apply'}))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)
