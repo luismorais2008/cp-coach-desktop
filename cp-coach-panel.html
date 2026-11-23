@@ -1,0 +1,195 @@
+<style>
+body{height:auto;min-height:100%;box-sizing:border-box;padding-bottom:var(--cp-pill-space,64px)}
+#frames{min-height:260px}
+#cp-blocker{position:fixed;bottom:12px;right:12px;max-width:calc(100vw - 24px);z-index:2147483647;background:#132238;color:#eef5ff;border:1px solid #6584ad;border-radius:16px;font:13px system-ui;box-shadow:0 3px 16px #0006;overflow:hidden}
+#cp-blocker[data-active="true"]{background:#382c14;border-color:#e5a84b}
+#cb-toggle{display:block;width:100%;background:transparent;color:inherit;border:0;padding:9px 12px;text-align:left;font:inherit;cursor:pointer}
+#cb-toggle:focus-visible{outline:2px solid #6cb0ff;outline-offset:-3px}
+#cp-blocker[data-expanded="true"]{width:350px}
+#cb-panel{padding:0 12px 12px;max-height:max(60px,calc(100vh - 100px));max-height:max(60px,calc(100dvh - 100px));overflow:auto;box-sizing:border-box}
+#cb-panel[hidden]{display:none}
+#cb-panel button,#cb-panel select,#cb-panel input{font:inherit;margin:4px 2px;padding:5px;max-width:100%;box-sizing:border-box}
+#cb-panel summary{cursor:pointer}
+#cb-history{white-space:pre-wrap;overflow-wrap:anywhere;font:12px system-ui}
+.cb-violation{display:flex;gap:4px;white-space:nowrap}
+.cb-detail{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#cb-error{color:#ffb4b4;overflow-wrap:anywhere}
+#cb-allowed{width:100%;box-sizing:border-box;font:12px monospace}
+@media(max-width:760px),(max-height:650px){
+  #cp-blocker[data-expanded="true"]{position:relative;bottom:auto;right:auto;align-self:flex-end;flex-shrink:0;margin:12px}
+}
+</style>
+<aside id="cp-blocker" data-expanded="false" aria-label="Controlo de IA">
+  <button id="cb-toggle" type="button" aria-expanded="false" aria-controls="cb-panel" title="Controlo de IA — expandir ou recolher"><span id="cb-summary">IA · A carregar…</span> <span id="cb-arrow" aria-hidden="true">▴</span></button>
+  <div id="cb-panel" hidden>
+    <strong>CP Coach · Controlo de IA</strong>
+    <div id="cb-status" aria-live="polite">A carregar…</div>
+    <select id="cb-mode" aria-label="Modo de IA"><option value="practice-ai">Prática com IA</option><option value="practice-no-ai">Prática sem IA</option><option value="contest">Contest</option></select>
+    <label>Minutos <input id="cb-min" type="number" min="1" max="10080" value="120" style="width:70px"></label>
+    <div id="cb-restriction"><label>Rede <select id="cb-strictness"><option value="strict">Só sites permitidos</option><option value="web">Pesquisa web permitida</option></select></label><div id="cb-weaker" hidden>Mais fraco: sites de IA desconhecidos podem responder. Chrome usa Google na vista Web (Ctrl+L). Firefox bloqueia Google; para pesquisar sem IA, abre https://noai.duckduckgo.com/html/. O motor original do Firefox não é alterado.</div></div>
+    <div><button id="cb-start">Iniciar</button><button id="cb-stop">Terminar sessão</button></div>
+    <div id="cb-mode-hint" hidden>Termina a sessão atual para mudar de modo.</div>
+    <div id="cb-error" role="alert"></div>
+    <details><summary>Sites permitidos — editar antes da sessão</summary><label for="cb-allowed">Um host por linha; *. opcional no início. Sem IPs, protocolos ou caminhos.</label><textarea id="cb-allowed" rows="7" spellcheck="false"></textarea><button id="cb-save-allowed">Guardar lista</button><button id="cb-reset-allowed">Repor predefinições</button></details>
+    <details><summary>Sessões e violações recentes</summary><pre id="cb-history"></pre></details>
+    <small>Bloqueio local de apoio, não infalível. Reinicia os navegadores após ativar e após terminar, para carregar/remover as políticas. Em Só sites permitidos, o acesso à Internet dos teus programas fica limitado à lista e à rede local; Google, Stack Overflow e YouTube não estão na lista inicial. Fechar esta janela mantém a monitorização em segundo plano. Sem captura de ecrã.</small>
+  </div>
+</aside>
+<script>
+(() => {
+  let current;
+  const $ = id => document.getElementById(id);
+  const modes = {'practice-ai': 'Prática com IA', 'practice-no-ai': 'Prática sem IA', contest: 'Contest'};
+  const key = 'cpcoach.panel.expanded';
+  const idleKey = 'cpcoach.panel.idle';
+  let idleRestored = false;
+  let allowedLoaded = false, allowedDirty = false;
+  const strictnessNames = {strict: 'Só sites permitidos', web: 'Pesquisa web permitida (mais fraco)'};
+  function restrictionHint() {
+    $('cb-restriction').hidden = $('cb-mode').value === 'practice-ai';
+    $('cb-weaker').hidden = $('cb-strictness').value !== 'web';
+  }
+  function rememberIdle() {
+    const mode = $('cb-mode').value, minutes = Number($('cb-min').value);
+    if (current || !modes[mode] || !Number.isFinite(minutes) || minutes < 1 || minutes > 10080) return;
+    idleRestored = true;
+    restrictionHint();
+    try { localStorage.setItem(idleKey, JSON.stringify({mode, minutes})); } catch (_) {}
+    fetch('/blocker/preferences', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-CP-Tools': '1'}, body: JSON.stringify({mode, minutes}), keepalive: true}).catch(() => {});
+  }
+  function restoreIdle(saved) {
+    try {
+      if (!saved) saved = JSON.parse(localStorage.getItem(idleKey));
+      if (saved && modes[saved.mode] && typeof saved.minutes === 'number' && saved.minutes >= 1 && saved.minutes <= 10080) {
+        $('cb-mode').value = saved.mode;
+        $('cb-min').value = saved.minutes;
+      }
+    } catch (_) {}
+    $('cb-strictness').value = 'strict';
+  }
+  restoreIdle();
+  $('cb-mode').onchange = rememberIdle;
+  $('cb-min').oninput = rememberIdle;
+  $('cb-strictness').onchange = rememberIdle;
+  $('cb-allowed').oninput = () => { allowedDirty = true; };
+  restrictionHint();
+  const date = value => new Date(value * 1000).toLocaleString('pt-PT');
+  const duration = seconds => Math.floor(seconds / 60) + ' min ' + Math.floor(seconds % 60) + ' s';
+  const reasons = {time: 'tempo esgotado', manual: 'terminada manualmente', early: 'contest terminado antecipadamente (violação)', emergency: 'interrompida — saída de emergência'};
+  function history(s) {
+    const log = $('cb-history');
+    log.replaceChildren();
+    const text = value => log.appendChild(document.createTextNode(value));
+    for (const x of [...(current ? [current] : []), ...s.sessions.slice(-8).reverse()]) {
+      text(modes[x.mode] + ' · ' + (x.end ? reasons[x.end_reason] || 'sessão terminada' : 'em curso') + (x.broken ? ' · sessão quebrada — monitorização interrompida' : '') + '\nInício: ' + date(x.start) + '\nFim: ' + (x.end ? date(x.end) : '—') + '\nDuração: ' + duration(Math.max(0, (x.end || s.now) - x.start)) + '\n');
+      if (x.mode !== 'practice-ai') text('Rede: ' + strictnessNames[x.strictness || 'web'] + '\n');
+      for (const event of x.lifecycle || []) text((event.event === 'background' ? 'Janela fechada; monitorização em segundo plano: ' : 'Aplicação reaberta/retomada: ') + date(event.time) + '\n');
+      for (const v of x.violations) {
+        const row = document.createElement('div');
+        row.className = 'cb-violation';
+        const stamp = document.createElement('span');
+        stamp.textContent = '⚠ ' + date(v.event_time || v.visit_time || v.time) + ' ' + v.kind;
+        row.appendChild(stamp);
+        const detail = document.createElement('span');
+        detail.className = 'cb-detail';
+        const full = v.url || v.process || v.message || '';
+        detail.textContent = full;
+        detail.title = full;
+        row.appendChild(detail);
+        if (v.action) {
+          const action = document.createElement('span');
+          action.textContent = ' · ' + v.action;
+          row.appendChild(action);
+        }
+        log.appendChild(row);
+      }
+      text('\n');
+    }
+    if (s.monitor_errors.length) text('Avisos: ' + s.monitor_errors.join('\n'));
+  }
+  function reserveSpace() {
+    const docked = getComputedStyle($('cp-blocker')).position === 'relative';
+    document.body.style.setProperty('--cp-pill-space', (docked ? 0 : $('cb-toggle').getBoundingClientRect().height + 24) + 'px');
+  }
+  function expand(value) {
+    $('cp-blocker').dataset.expanded = String(value);
+    $('cb-toggle').setAttribute('aria-expanded', String(value));
+    $('cb-panel').hidden = !value;
+    $('cb-arrow').textContent = value ? '▾' : '▴';
+    reserveSpace();
+    if (value && getComputedStyle($('cp-blocker')).position === 'relative') $('cp-blocker').scrollIntoView({block: 'nearest'});
+  }
+  let expanded = false;
+  try { expanded = localStorage.getItem(key) === 'true'; } catch (_) {}
+  expand(expanded);
+  $('cb-toggle').onclick = () => {
+    expanded = !expanded;
+    expand(expanded);
+    try { localStorage.setItem(key, String(expanded)); } catch (_) {}
+  };
+  window.addEventListener('resize', reserveSpace);
+  if (window.ResizeObserver) new ResizeObserver(reserveSpace).observe($('cb-toggle'));
+  async function refresh() {
+    try {
+      const s = await (await fetch('/blocker/status')).json();
+      const wasActive = !!current;
+      current = s.current;
+      const left = current?.deadline ? ' · ' + Math.max(0, Math.ceil((current.deadline - Date.now() / 1000) / 60)) + ' min' : '';
+      const network = s.network.active ? 'Rede: bloqueada' : s.network.hosts || s.network.policies || s.network.nft ? 'Rede: bloqueio incompleto' : 'Rede: não bloqueada';
+      const summary = (current ? modes[current.mode] : 'Sem sessão ativa') + left + ' · ' + network;
+      $('cb-summary').textContent = summary;
+      $('cp-blocker').dataset.active = String(!!current);
+      $('cb-status').textContent = summary + (s.network.reason ? ' — ' + s.network.reason : '');
+      $('cb-start').disabled = !!current;
+      $('cb-stop').disabled = !current;
+      $('cb-mode').disabled = !!current;
+      $('cb-min').readOnly = !!current;
+      $('cb-strictness').disabled = !!current;
+      $('cb-allowed').disabled = !!current;
+      $('cb-save-allowed').disabled = !!current;
+      $('cb-reset-allowed').disabled = !!current;
+      $('cb-mode-hint').hidden = !current;
+      if (current) {
+        $('cb-mode').value = current.mode;
+        $('cb-min').value = current.minutes || Math.round((current.deadline - current.start) / 60);
+        $('cb-strictness').value = current.strictness || 'web';
+      } else if (wasActive || !idleRestored) {
+        restoreIdle(s.idle);
+        idleRestored = true;
+      }
+      restrictionHint();
+      if (current || (!allowedLoaded && !allowedDirty)) {
+        $('cb-allowed').value = (current?.allowed || s.allowed || []).join('\n');
+        allowedLoaded = true;
+      }
+      history(s);
+    } catch (error) { $('cb-error').textContent = String(error); }
+  }
+  async function action(path, body) {
+    $('cb-error').textContent = '';
+    try {
+      const response = await fetch('/blocker/' + path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-CP-Tools': '1'}, body: JSON.stringify(body)});
+      const data = await response.json();
+      if (!response.ok) throw Error(data.error);
+      if (path === 'allowed') { allowedLoaded = false; allowedDirty = false; }
+      await refresh();
+    } catch (error) { $('cb-error').textContent = error.message; }
+  }
+  $('cb-start').onclick = () => {
+    rememberIdle();
+    action('start', {mode: $('cb-mode').value, minutes: Number($('cb-min').value), strictness: $('cb-strictness').value});
+  };
+  $('cb-save-allowed').onclick = () => action('allowed', {allowed: $('cb-allowed').value});
+  $('cb-reset-allowed').onclick = () => action('allowed', {reset: true});
+  $('cb-stop').onclick = () => {
+    let confirmation = '';
+    if (current?.mode === 'contest' && current.deadline > Date.now() / 1000) {
+      confirmation = prompt('Terminar antecipadamente é uma violação. Escreve TERMINAR CONTEST:');
+      if (confirmation === null) return;
+    }
+    action('stop', {confirmation});
+  };
+  refresh();
+  setInterval(refresh, 3000);
+})();
+</script>
