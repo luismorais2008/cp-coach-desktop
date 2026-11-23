@@ -25,7 +25,7 @@ if command -v apt-get >/dev/null; then
             WEBKIT=(gir1.2-webkit2-4.0)
         fi
         MISSING=()
-        for package in python3-gi python3-pip "${WEBKIT[@]}"; do
+        for package in python3-gi python3-pip nftables wmctrl "${WEBKIT[@]}"; do
             if [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != 'install ok installed' ]]; then
                 MISSING+=("$package")
             fi
@@ -50,10 +50,11 @@ if ! command -v visudo >/dev/null; then
     exit 1
 fi
 sudo install -d -o root -g root -m 755 /usr/local/lib/cp-coach
+sudo install -d -o root -g root -m 755 /var/lib/cp-coach
 sudo install -o root -g root -m 755 "$APP_DIR/cp-coach-hosts-helper" /usr/local/lib/cp-coach/cp-coach-hosts-helper
 RULE="$(mktemp)"
 trap 'rm -f -- "$RULE"' EXIT
-printf '%s ALL=(root) NOPASSWD: /usr/local/lib/cp-coach/cp-coach-hosts-helper apply, /usr/local/lib/cp-coach/cp-coach-hosts-helper remove, /usr/local/lib/cp-coach/cp-coach-hosts-helper status\n' "$INSTALL_USER" > "$RULE"
+printf '%s ALL=(root) NOPASSWD: /usr/local/lib/cp-coach/cp-coach-hosts-helper apply, /usr/local/lib/cp-coach/cp-coach-hosts-helper apply-strict, /usr/local/lib/cp-coach/cp-coach-hosts-helper refresh, /usr/local/lib/cp-coach/cp-coach-hosts-helper remove, /usr/local/lib/cp-coach/cp-coach-hosts-helper finish, /usr/local/lib/cp-coach/cp-coach-hosts-helper interrupt, /usr/local/lib/cp-coach/cp-coach-hosts-helper journal, /usr/local/lib/cp-coach/cp-coach-hosts-helper watch, /usr/local/lib/cp-coach/cp-coach-hosts-helper status, /usr/local/lib/cp-coach/cp-coach-hosts-helper strict-status\n' "$INSTALL_USER" > "$RULE"
 if ! sudo visudo -qcf "$RULE"; then
     echo 'Falha: regra sudo inválida; não foi instalada.' >&2
     exit 1
@@ -74,6 +75,9 @@ destination.mkdir(parents=True, exist_ok=True)
 desktop = destination / 'cp-coach.desktop'
 desktop.write_text('[Desktop Entry]\nType=Application\nName=CP Coach\nComment=CP Tools e controlo local de IA\nExec=' + quoted(python) + ' ' + quoted(str(Path(app) / 'cp-coach.py')) + '\nIcon=cp-coach\nStartupWMClass=cp-coach\nTerminal=false\nCategories=Education;Development;\n', encoding='utf-8')
 desktop.chmod(0o644)
+autostart = Path(home) / '.config/autostart'
+autostart.mkdir(parents=True, exist_ok=True)
+(autostart / 'cp-coach-monitor.desktop').write_text('[Desktop Entry]\nType=Application\nName=CP Coach — retomar monitorização\nExec=' + quoted(python) + ' ' + quoted(str(Path(app) / 'cp-coach.py')) + ' --resume-only\nIcon=cp-coach\nTerminal=false\nX-GNOME-Autostart-enabled=true\n', encoding='utf-8')
 import shutil
 for size, name in [('scalable', 'cp-coach.svg'), ('256x256', 'cp-coach.png')]:
     icons = Path(home) / '.local/share/icons/hicolor' / size / 'apps'

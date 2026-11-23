@@ -1,17 +1,36 @@
 #!/usr/bin/python3 -I
 """Restricted privileged hosts editor. Install root-owned before granting sudo access."""
 import fcntl
+import base64
 import json
+import hashlib
+import ipaddress
 import os
+from pathlib import Path
 import stat
+import re
+import socket
+import subprocess
 import sys
 import tempfile
+import time
+import math
+import uuid
+import select
+from concurrent.futures import ThreadPoolExecutor
 
 BEGIN = '# BEGIN cp-coach'
 END = '# END cp-coach'
 DOMAINS = '''chatgpt.com chat.openai.com openai.com api.openai.com claude.ai anthropic.com gemini.google.com bard.google.com aistudio.google.com copilot.microsoft.com perplexity.ai chat.deepseek.com deepseek.com poe.com grok.com x.ai meta.ai chat.mistral.ai huggingface.co phind.com you.com character.ai api.githubcopilot.com copilot-proxy.githubusercontent.com codeium.com windsurf.com cursor.com cursor.sh tabnine.com blackbox.ai'''.split()
 DOMAINS += '''api.anthropic.com console.anthropic.com statsig.anthropic.com claude.com devin.ai app.devin.ai api.devin.ai cognition.ai server.codeium.com inference.codeium.com generativelanguage.googleapis.com cloudcode-pa.googleapis.com api.deepseek.com api.mistral.ai api.x.ai api.groq.com groq.com openrouter.ai api.together.xyz together.ai ollama.com api.individual.githubcopilot.com api.business.githubcopilot.com api.enterprise.githubcopilot.com copilot-telemetry.githubusercontent.com api2.cursor.sh api.cursor.com ampcode.com opencode.ai api.moonshot.ai dashscope.aliyuncs.com'''.split()
 DOMAINS += '''z.ai chat.z.ai chatglm.cn kimi.com kimi.moonshot.cn chat.qwen.ai qwen.ai tongyi.aliyun.com doubao.com yiyan.baidu.com pi.ai lmarena.ai chat.lmsys.org genspark.ai manus.im notebooklm.google.com t3.chat monica.im duck.ai felo.ai chat.minimax.io hailuoai.com'''.split()
+DOMAINS += '''duckduckgo.com duckchat.com qwenlm.ai chat.qwenlm.ai qianwen.com chat.qianwen.com dashscope-intl.aliyuncs.com'''.split()
+DOMAINS += '''deepai.org search.brave.com ai-search.brave.com ai-chat.bsg.brave.com leo.brave.com iask.ai andisearch.com komo.ai alice.yandex.ru alice.yandex.com yandexgpt.yandex.ru aistudio.yandex.ru gpt.yandex.ru 300.ya.ru sydney.bing.com edgeservices.bing.com'''.split()
+DOMAINS += '''pollinations.ai text.pollinations.ai image.pollinations.ai gen.pollinations.ai enter.pollinations.ai venice.ai api.venice.ai kagi.com models.github.ai models.inference.ai.azure.com router.huggingface.co api-inference.huggingface.co api.cerebras.ai inference.cerebras.ai cerebras.ai api.fireworks.ai fireworks.ai api.deepinfra.com deepinfra.com api.cohere.ai api.cohere.com cohere.ai cohere.com api.together.ai together.xyz'''.split()
+DUCK_ALIASES = '''duck.com duck.co duckgo.com ddg.gg ddg.co duckduckgo.ca duckduckgo.co duckduckgo.co.uk duckduckgo.com.mx duckduckgo.com.tw duckduckgo.de duckduckgo.nl duckduckgo.org duckduckgo.pl duckduckgo.se duckduckgo.uk duckduckgo.ai'''.split()
+DUCK_SEARCH_HOSTS = '''safe.duckduckgo.com start.duckduckgo.com html.duckduckgo.com lite.duckduckgo.com links.duckduckgo.com'''.split()
+DOMAINS += DUCK_ALIASES + DUCK_SEARCH_HOSTS
+DOMAINS += '''heck.ai chat.akash.network hf.space gradio.live chatbot.app aichatting.net unlimitedai.org metaso.cn exa.ai morphic.sh arena.ai'''.split()
 AI_DOMAINS = sorted(set(DOMAINS + ['www.' + d for d in DOMAINS]))
 NON_CHAT_HOSTS = {'openai.com', 'www.openai.com', 'anthropic.com', 'www.anthropic.com',
                   'api-docs.deepseek.com', 'platform.deepseek.com', 'help.openai.com',
@@ -21,6 +40,249 @@ NON_CHAT_HOSTS = {'openai.com', 'www.openai.com', 'anthropic.com', 'www.anthropi
 DOMAINS = [domain for domain in AI_DOMAINS if domain not in NON_CHAT_HOSTS]
 BLOCK = BEGIN + '\n' + ''.join(f'{ip} {d}\n' for d in DOMAINS for ip in ('0.0.0.0', '::')) + END + '\n'
 ENTRIES = {f'{ip} {domain}' for domain in AI_DOMAINS for ip in ('0.0.0.0', '::')}
+POLICY_STATE = Path('/var/lib/cp-coach/browser-policies.json')
+CHROME_DIRS = ['/etc/opt/chrome', '/etc/chromium', '/etc/chromium-browser',
+               '/etc/brave', '/etc/opt/brave', '/etc/opt/edge']
+OPTIONAL_CHROME_DIRS = ['/etc/opt/chrome_for_testing', '/var/snap/chromium/current']
+FIREFOX_DIRS = ['/usr/lib/firefox/distribution', '/usr/lib/firefox-esr/distribution',
+                '/opt/firefox/distribution', '/var/snap/firefox/common/policies']
+GOOGLE_SEARCH_DOMAINS = '''google.com google.ad google.ae google.com.af google.com.ag google.al google.am google.co.ao google.com.ar google.as google.at google.com.au google.az google.ba google.com.bd google.be google.bf google.bg google.com.bh google.bi google.bj google.com.bn google.com.bo google.com.br google.bs google.bt google.co.bw google.by google.com.bz google.ca google.cd google.cf google.cg google.ch google.ci google.co.ck google.cl google.cm google.cn google.com.co google.co.cr google.com.cu google.cv google.com.cy google.cz google.de google.dj google.dk google.dm google.com.do google.dz google.com.ec google.ee google.com.eg google.es google.com.et google.fi google.com.fj google.fm google.fr google.ga google.ge google.gg google.com.gh google.com.gi google.gl google.gm google.gr google.com.gt google.gy google.com.hk google.hn google.hr google.ht google.hu google.co.id google.ie google.co.il google.im google.co.in google.iq google.is google.it google.je google.com.jm google.jo google.co.jp google.co.ke google.com.kh google.ki google.kg google.co.kr google.com.kw google.kz google.la google.com.lb google.li google.lk google.co.ls google.lt google.lu google.lv google.com.ly google.co.ma google.md google.me google.mg google.mk google.ml google.com.mm google.mn google.com.mt google.mu google.mv google.mw google.com.mx google.com.my google.co.mz google.com.na google.com.ng google.com.ni google.ne google.nl google.no google.com.np google.nr google.nu google.co.nz google.com.om google.com.pa google.com.pe google.com.pg google.com.ph google.com.pk google.pl google.pn google.com.pr google.ps google.pt google.com.py google.com.qa google.ro google.ru google.rw google.com.sa google.com.sb google.sc google.se google.com.sg google.sh google.si google.sk google.com.sl google.sn google.so google.sm google.sr google.st google.com.sv google.td google.tg google.co.th google.com.tj google.tl google.tm google.tn google.to google.com.tr google.tt google.com.tw google.co.tz google.com.ua google.co.ug google.co.uk google.com.uy google.co.uz google.com.vc google.co.ve google.co.vi google.com.vn google.com.vu google.ws google.rs google.co.za google.co.zm google.co.zw google.cat'''.split()
+GOOGLE_AI_PATHS = ('/ai', '/async/folif', '/async/folwr', '/async/folsrch')
+GOOGLE_WEB_SEARCH = 'https://www.google.com/search?q={searchTerms}&udm=14'
+GOOGLE_WEB_NAME = 'Google Web (CP Coach)'
+FIREFOX_DUCK_HOSTS = ('duckduckgo.com', 'www.duckduckgo.com', 'html.duckduckgo.com',
+                      'lite.duckduckgo.com', 'start.duckduckgo.com', 'safe.duckduckgo.com')
+EXTRA_AI_PATHS = [(host, path) for host in ('bing.com', 'www.bing.com') for path in ('/copilotsearch', '/chat', '/copilot', '/turing', '/sydney')]
+EXTRA_AI_PATHS += [(host, path) for host in ('ya.ru', 'yandex.ru', 'yandex.com') for path in ('/ai', '/alice', '/chat', '/neuro', '/gpt')]
+DEFAULT_ALLOWED = '''*.codeforces.com *.codeforces.org sta.codeforces.com userpic.codeforces.org *.atcoder.jp img.atcoder.jp atcoder.jp *.cses.fi cses.fi *.codechef.com codechef.com www.codechef.com cdn.codechef.com *.kattis.com open.kattis.com *.vjudge.net vjudge.net *.leetcode.com leetcode.com assets.leetcode.com *.usaco.guide usaco.guide usaco-guide.firebaseio.com *.cp-algorithms.com cp-algorithms.com *.cppreference.com en.cppreference.com cppreference.com *.cplusplus.com cplusplus.com docs.python.org raw.githubusercontent.com api.github.com judge.yosupo.jp onlinejudge.org www.luogu.com.cn challenges.cloudflare.com cdnjs.cloudflare.com cdn.jsdelivr.net unpkg.com ajax.googleapis.com fonts.googleapis.com fonts.gstatic.com licensebuttons.net'''.split()
+STRICT_STATE = Path('/run/cp-coach-strict.json')
+NFT = '/usr/sbin/nft'
+RESTRICTION_STATE = Path('/var/lib/cp-coach/restriction.json')
+EMERGENCY_JOURNAL = Path('/var/lib/cp-coach/emergency-journal.json')
+
+
+def validate_allowed(value):
+    if isinstance(value, str):
+        value = value.splitlines()
+    if not isinstance(value, list) or not 1 <= len(value) <= 128:
+        raise ValueError('Lista permitida: entre 1 e 128 nomes de hosts, um por linha.')
+    result = set()
+    for entry in value:
+        if not isinstance(entry, str):
+            raise ValueError('Cada entrada tem de ser um nome de host.')
+        entry = entry.strip().lower()
+        host = entry[2:] if entry.startswith('*.') else entry
+        if not 1 <= len(host) <= 253 or '.' not in host or not re.fullmatch(r'[a-z][a-z0-9-]*', host.rsplit('.', 1)[-1]) or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label) for label in host.split('.')):
+            raise ValueError('Host inválido: ' + entry + '. Usa só nomes, com *. opcional no início; sem IPs, protocolos ou caminhos.')
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            pass
+        else:
+            raise ValueError('Endereços IP não são permitidos: ' + entry)
+        if host.replace('.', '').isdigit():
+            raise ValueError('Endereços IP não são permitidos: ' + entry)
+        result.add(entry)
+    return sorted(result)
+
+
+def google_search_patterns(kind, web_only=False):
+    if kind == 'chrome':
+        return [host + '/search' + ('?udm=14' if web_only else '') for host in GOOGLE_SEARCH_DOMAINS]
+    return ['*://*.' + host + '/search' + query for host in GOOGLE_SEARCH_DOMAINS
+            for query in (('?udm=14*', '?*&udm=14*') if web_only else ('*',))]
+
+
+def google_ai_patterns(kind):
+    if kind == 'chrome':
+        return [host + path for host in GOOGLE_SEARCH_DOMAINS for path in ('/ai', '/async/fol', '/?udm=50')]
+    return ['*://*.' + host + path for host in GOOGLE_SEARCH_DOMAINS for path in ('/ai*', '/async/fol*', '/*udm=*')]
+
+
+def firefox_duck_patterns():
+    return ['*://*.duckduckgo.com/*']
+
+
+def firefox_engine_search_patterns():
+    routes = [('bing.com', '/search'), ('search.brave.com', '/search'), ('search.brave.com', '/ask'),
+              ('ecosia.org', '/search'), ('ecosia.org', '/chat'), ('search.yahoo.com', '/'),
+              ('search.yahoo.co.jp', '/'), ('startpage.com', '/'), ('qwant.com', '/'),
+              ('qwantjunior.com', '/'), ('perplexity.ai', '/'), ('you.com', '/'), ('kagi.com', '/'),
+              ('baidu.com', '/s'), ('search.naver.com', '/'), ('search.daum.net', '/'),
+              ('m.search.daum.net', '/'), ('coccoc.com', '/search'), ('search.seznam.cz', '/')]
+    routes += [(host, '/search') for host in ('yandex.ru', 'yandex.com', 'yandex.by', 'yandex.kz', 'yandex.com.tr', 'ya.ru')]
+    routes += [('amazon.' + suffix, path) for suffix in ('com', 'co.uk', 'de', 'fr', 'it', 'es', 'co.jp')
+               for path in ('/s', '/gp/search')]
+    routes += [('ebay.' + suffix, '/sch') for suffix in ('com', 'at', 'ca', 'ch', 'co.uk', 'com.au', 'de', 'es', 'fr', 'ie', 'it', 'nl', 'pl', 'be')]
+    return ['*://*.' + host + path + '*' for host, path in routes] + [
+        '*://*.wikipedia.org/*search=*', '*://*.wikipedia.org/wiki/*:*']
+
+
+def policy_targets():
+    chrome = [Path(folder) / 'policies/managed/cp-coach.json' for folder in CHROME_DIRS]
+    chrome += [Path(folder) / 'policies/managed/cp-coach.json' for folder in OPTIONAL_CHROME_DIRS if Path(folder).exists()]
+    firefox = [Path('/etc/firefox/policies/policies.json')]
+    firefox += [Path(folder) / 'policies.json' for folder in FIREFOX_DIRS if Path(folder).parent.exists()]
+    return [(path, 'chrome') for path in chrome] + [(path, 'firefox') for path in firefox]
+
+
+def browser_policy(kind, original=None, allowed=None):
+    policy = json.loads(json.dumps(original or {}))
+    domains = [host for host in DOMAINS if not (host.startswith('www.') and host[4:] in DOMAINS)]
+    exceptions = sorted(NON_CHAT_HOSTS - {'platform.openai.com', 'platform.deepseek.com', 'openai.com', 'www.openai.com', 'anthropic.com', 'www.anthropic.com'})
+    if kind == 'chrome':
+        policy.update(DnsOverHttpsMode='off', QuicAllowed=False,
+                      AIModeSettings=1, GeminiSettings=1, HelpMeWriteSettings=2,
+                      TabCompareSettings=2, HistorySearchSettings=2,
+                      DevToolsGenAiSettings=2, CreateThemesSettings=2,
+                      SearchContentSharingSettings=1,
+                      DefaultSearchProviderEnabled=True,
+                      DefaultSearchProviderName=GOOGLE_WEB_NAME,
+                      DefaultSearchProviderKeyword='google.com',
+                      DefaultSearchProviderSearchURL=GOOGLE_WEB_SEARCH,
+                      URLBlocklist=sorted(set(domains + google_ai_patterns(kind) + google_search_patterns(kind) + ['duckduckgo.com/duckchat', 'duckduckgo.com@ia=chat', 'platform.openai.com/playground'])),
+                      URLAllowlist=exceptions + google_search_patterns(kind, web_only=True) + ['platform.deepseek.com/' + path for path in ('docs', 'api-docs', 'documentation')])
+        policy['URLBlocklist'] += [host + path for host, path in EXTRA_AI_PATHS]
+        if allowed is not None:
+            policy['URLBlocklist'] = ['*']
+            policy['URLAllowlist'] = [('' if host.startswith('*.') else '.') + host.removeprefix('*.') for host in validate_allowed(allowed)] + ['.localhost', '.127.0.0.1', 'http://[::1]']
+    else:
+        policies = policy.setdefault('policies', {})
+        policies['DNSOverHTTPS'] = {'Enabled': False, 'Locked': True}
+        if allowed is not None:
+            policies['SearchEngines'] = {'Add': [{'Name': GOOGLE_WEB_NAME, 'URLTemplate': GOOGLE_WEB_SEARCH,
+                                             'Method': 'GET', 'Encoding': 'UTF-8'}],
+                                       'Default': GOOGLE_WEB_NAME, 'DefaultPrivate': GOOGLE_WEB_NAME}
+        else:
+            policies['SearchEngines'] = {'PreventInstalls': True}
+        policies['WebsiteFilter'] = {
+            'Block': sorted(set(['*://*.' + host + '/*' for host in domains if host != 'duckduckgo.com'] + google_ai_patterns(kind) + google_search_patterns(kind) + firefox_duck_patterns() + firefox_engine_search_patterns() + ['*://platform.openai.com/playground*'])),
+            'Exceptions': ['*://' + host + '/*' for host in exceptions] + ['*://platform.deepseek.com/' + path + '*' for path in ('docs', 'api-docs', 'documentation')] + ['https://noai.duckduckgo.com/html/', 'https://noai.duckduckgo.com/html/?q=*'],
+        }
+        preferences = policies.setdefault('Preferences', {})
+        preferences['network.http.http3.enable'] = {'Value': False, 'Status': 'locked'}
+        policies['WebsiteFilter']['Block'] += ['*://' + host + path + '*' for host, path in EXTRA_AI_PATHS]
+        if allowed is not None:
+            policies['WebsiteFilter'] = {'Block': ['<all_urls>'], 'Exceptions': ['*://' + host + '/*' for host in validate_allowed(allowed)] + ['*://localhost/*', '*://127.0.0.1/*', '*://[::1]/*']}
+    return policy
+
+
+def safe_path(path, create=False):
+    path = Path(path)
+    for parent in reversed(path.parents):
+        if not parent.exists():
+            if not create:
+                continue
+            parent.mkdir(mode=0o755)
+        info = parent.stat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError('Diretório de políticas inseguro: ' + str(parent))
+        if parent.is_symlink():
+            link = parent.lstat()
+            if link.st_uid != 0:
+                raise ValueError('Ligação de políticas insegura: ' + str(parent))
+            safe_path(parent.resolve() / '.cp-coach-check')
+    if path.exists() or path.is_symlink():
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError('Ficheiro de políticas inseguro: ' + str(path))
+
+
+def atomic_write(path, contents, mode=0o644, uid=0, gid=0):
+    safe_path(path, create=True)
+    fd, temporary = tempfile.mkstemp(prefix='.cp-coach-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as target:
+            os.fchmod(target.fileno(), mode)
+            os.fchown(target.fileno(), uid, gid)
+            target.write(contents)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def load_policy_state():
+    safe_path(POLICY_STATE)
+    return json.loads(POLICY_STATE.read_text()) if POLICY_STATE.exists() else {}
+
+
+def change_policies(action, allowed=None):
+    state = load_policy_state()
+    targets = dict((str(path), kind) for path, kind in policy_targets())
+    allowed_paths = {folder + '/policies/managed/cp-coach.json' for folder in CHROME_DIRS + OPTIONAL_CHROME_DIRS} | {folder + '/policies.json' for folder in FIREFOX_DIRS} | {'/etc/firefox/policies/policies.json'}
+    if set(state) - (set(targets) | allowed_paths):
+        raise ValueError('Caminhos de políticas guardados indisponíveis; mantenha os backups em /var/lib/cp-coach e repare a instalação do navegador.')
+    if action == 'apply':
+        for filename, kind in targets.items():
+            path = Path(filename)
+            safe_path(path, create=True)
+            if filename not in state:
+                if path.exists():
+                    info = path.stat()
+                    contents = path.read_bytes()
+                    json.loads(contents)
+                    state[filename] = dict(content=base64.b64encode(contents).decode(), mode=stat.S_IMODE(info.st_mode), uid=info.st_uid, gid=info.st_gid)
+                else:
+                    state[filename] = None
+                atomic_write(POLICY_STATE, json.dumps(state).encode(), 0o600)
+            original = json.loads(base64.b64decode(state[filename]['content'])) if state[filename] else {}
+            atomic_write(path, json.dumps(browser_policy(kind, original, allowed), ensure_ascii=False, indent=2).encode())
+    else:
+        for filename, previous in list(state.items()):
+            path = Path(filename)
+            safe_path(path)
+            if previous is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_write(path, base64.b64decode(previous['content']), previous['mode'], previous['uid'], previous['gid'])
+            del state[filename]
+            atomic_write(POLICY_STATE, json.dumps(state).encode(), 0o600)
+        if POLICY_STATE.exists():
+            POLICY_STATE.unlink()
+
+
+def policy_status(allowed=None):
+    def includes(actual, expected):
+        if isinstance(expected, dict):
+            return isinstance(actual, dict) and all(includes(actual.get(key), value) for key, value in expected.items())
+        return actual == expected
+    for path, kind in policy_targets():
+        try:
+            actual = json.loads(path.read_text())
+            expected = browser_policy(kind, allowed=allowed)
+            if kind == 'firefox':
+                actual, expected = actual['policies'], expected['policies']
+            if not includes(actual, expected):
+                return False
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+    return True
+
+
+def noai_entry(line):
+    fields = line.split()
+    if len(fields) != 2 or fields[1] != 'noai.duckduckgo.com':
+        return False
+    try:
+        ipaddress.ip_address(fields[0])
+        return True
+    except ValueError:
+        return False
+
+
+def noai_hosts_block():
+    try:
+        addresses = sorted({str(ipaddress.ip_address(item[4][0])) for item in
+                            socket.getaddrinfo('noai.duckduckgo.com', 443, type=socket.SOCK_STREAM)
+                            if ipaddress.ip_address(item[4][0]).is_global})
+    except socket.gaierror as error:
+        raise ValueError('Não foi possível resolver DuckDuckGo noai.') from error
+    if not addresses:
+        raise ValueError('DuckDuckGo noai não tem endereços públicos disponíveis.')
+    return BEGIN + '\n' + ''.join(ip + ' noai.duckduckgo.com\n' for ip in addresses) + END + '\n'
 
 
 def stripped(contents):
@@ -31,21 +293,211 @@ def stripped(contents):
             inside = True
         elif line.strip() == END:
             inside = False
-        elif not inside or line.strip() not in ENTRIES:
+        elif not inside or (line.strip() not in ENTRIES and not noai_entry(line)):
             result.append(line)
     return ''.join(result)
 
 
+def caller_uid():
+    value = os.environ.get('SUDO_UID') or os.environ.get('PKEXEC_UID', '')
+    if not value.isdecimal() or not 0 < int(value) < 2**32 - 1:
+        raise ValueError('UID de origem indisponível; usa sudo ou pkexec como utilizador normal.')
+    return int(value)
+
+
+def nft_run(arguments, body=None):
+    result = subprocess.run([NFT] + arguments, input=body, capture_output=True, text=True, timeout=8)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or 'Falha do nftables')
+    return result.stdout
+
+
+def nft_exists():
+    if not Path(NFT).exists():
+        return False
+    return any(item.get('table', {}).get('family') == 'inet' and item.get('table', {}).get('name') == 'cp_coach' for item in json.loads(nft_run(['-j', 'list', 'tables']))['nftables'])
+
+
+def nft_fingerprint():
+    entries = json.loads(nft_run(['-j', 'list', 'table', 'inet', 'cp_coach']))['nftables']
+    def normalize(value):
+        if isinstance(value, dict):
+            return {key: normalize(item) for key, item in value.items() if key != 'handle'}
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        return value
+    body = [normalize(item) for item in entries if 'metainfo' not in item]
+    return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+
+
+def nft_rules(uid, addresses, replace=False):
+    sets = []
+    for version in (4, 6):
+        values = sorted({str(ipaddress.ip_address(ip)) for ip in addresses if ipaddress.ip_address(ip).version == version})
+        elements = 'elements = { ' + ', '.join(values) + ' };' if values else ''
+        sets.append('set allowed%d { type ipv%d_addr; %s }' % (version, version, elements))
+    return ('delete table inet cp_coach\n' if replace else '') + '''table inet cp_coach {
+%s
+chain output {
+ type filter hook output priority -10; policy accept;
+ meta skuid != %d return
+ oifname "lo" accept
+ ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/24, 239.255.0.0/16, 255.255.255.255/32 } accept
+ ip6 daddr { ::1/128, fc00::/7, fe80::/10, ff02::/16, ff12::/16 } accept
+ ip daddr @allowed4 accept
+ ip6 daddr @allowed6 accept
+ reject with icmpx type admin-prohibited
+}
+}
+''' % ('\n'.join(sets), uid)
+
+
+def load_strict_state():
+    safe_path(STRICT_STATE)
+    return json.loads(STRICT_STATE.read_text()) if STRICT_STATE.exists() else None
+
+
+def set_strict(uid, allowed, addresses, unresolved):
+    nft_run(['-f', '-'], nft_rules(uid, addresses, nft_exists()))
+    atomic_write(STRICT_STATE, json.dumps(dict(uid=uid, allowed=allowed, addresses=addresses, unresolved=unresolved, fingerprint=nft_fingerprint())).encode(), 0o600)
+
+
+def refresh_strict(uid, allowed):
+    def resolve(host):
+        try:
+            addresses = {item[4][0] for item in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)}
+            return host, sorted(addresses)
+        except socket.gaierror:
+            return host, []
+    hosts = sorted({host.removeprefix('*.') for host in allowed})
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        resolved = list(pool.map(resolve, hosts))
+    addresses = sorted({address for _, values in resolved for address in values})
+    unresolved = [host for host, values in resolved if not values]
+    set_strict(uid, allowed, addresses, unresolved)
+
+
+def strict_status(uid):
+    state = load_strict_state()
+    active = bool(state and state['uid'] == uid and nft_exists() and nft_fingerprint() == state['fingerprint'])
+    allowed = validate_allowed(state['allowed']) if state and state['uid'] == uid else []
+    hosts = BLOCK in Path('/etc/hosts').read_text()
+    policies = policy_status(allowed) if allowed else False
+    reason = '' if active else 'Firewall nftables ausente ou alterada.'
+    if not hosts or not policies:
+        reason += ' Hosts ou políticas ausentes.'
+    if state and state.get('unresolved'):
+        reason += ' Sem DNS para: ' + ', '.join(state['unresolved'])
+    return dict(active=active and hosts and policies, nft=active, hosts=hosts, policies=policies, allowed=allowed, uid=uid, reason=reason.strip())
+
+
+def remove_strict():
+    if nft_exists():
+        nft_run(['delete', 'table', 'inet', 'cp_coach'])
+    safe_path(STRICT_STATE)
+    STRICT_STATE.unlink(missing_ok=True)
+
+
+def root_json(path, default):
+    safe_path(path)
+    return json.loads(path.read_text()) if path.exists() else default
+
+
+def restriction_event(state, how):
+    events = root_json(EMERGENCY_JOURNAL, [])
+    events.append(dict(id=uuid.uuid4().hex, session=state['id'], uid=state['uid'], start=state['start'], deadline=state['deadline'], mode=state.get('mode', 'practice-no-ai'), strict=state['strict'], time=time.time(), how=how))
+    atomic_write(EMERGENCY_JOURNAL, json.dumps(events[-256:]).encode(), 0o600)
+
+
+def record_restriction(uid, value, strict):
+    now = time.time()
+    if value is None:
+        value = dict(id=uuid.uuid4().hex, start=now, deadline=now + 86400)
+    if not isinstance(value, dict) or not re.fullmatch('[0-9a-f]{32}', str(value.get('id', ''))):
+        raise ValueError('Identificador de sessão inválido.')
+    for key in ('start', 'deadline'):
+        number = value.get(key)
+        if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number):
+            raise ValueError('Prazo de sessão inválido.')
+    if not value['start'] <= now + 60 or not now - 60 < value['deadline'] <= now + 604860 or value['deadline'] <= value['start']:
+        raise ValueError('Prazo de sessão inválido.')
+    mode = value.get('mode', 'practice-no-ai')
+    if mode not in ('contest', 'practice-no-ai'):
+        raise ValueError('Modo de restrição inválido.')
+    previous = root_json(RESTRICTION_STATE, None)
+    if previous and previous['id'] != value['id'] and previous['deadline'] > now:
+        restriction_event(previous, 'restriction replaced')
+    state = dict(id=value['id'], start=value['start'], deadline=value['deadline'], uid=uid, strict=strict, mode=mode)
+    atomic_write(RESTRICTION_STATE, json.dumps(state).encode(), 0o600)
+
+
+def end_restriction(how, normal_id=None, interrupted=False):
+    state = root_json(RESTRICTION_STATE, None)
+    if state:
+        if normal_id is not None and (normal_id != state['id'] or caller_uid() != state['uid']):
+            raise ValueError('A sessão não corresponde à restrição ativa.')
+        if interrupted or (normal_id is None and time.time() < state['deadline']):
+            restriction_event(state, how)
+        RESTRICTION_STATE.unlink()
+
+
+def watch_firewall(uid):
+    state = root_json(RESTRICTION_STATE, None)
+    if not state or state['uid'] != uid or not state['strict']:
+        return
+    process = subprocess.Popen([NFT, 'monitor', 'ruleset'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+    try:
+        while process.poll() is None:
+            ready, _, _ = select.select([sys.stdin.buffer, process.stdout], [], [], 1)
+            if sys.stdin.buffer in ready:
+                return
+            if process.stdout in ready:
+                line = process.stdout.readline()
+                if not line:
+                    return
+                if b'cp_coach' in line:
+                    print('changed', flush=True)
+    finally:
+        process.terminate()
+        process.wait(timeout=3)
+
+
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in ('apply', 'remove', 'status'):
-        raise ValueError('Uso: cp-coach-hosts-helper apply|remove|status')
+    verbs = ('apply', 'apply-strict', 'refresh', 'remove', 'finish', 'interrupt', 'journal', 'watch', 'status', 'strict-status')
+    if len(sys.argv) != 2 or sys.argv[1] not in verbs:
+        raise ValueError('Uso: cp-coach-hosts-helper ' + '|'.join(verbs))
     action = sys.argv[1]
     if action == 'status':
         with open('/etc/hosts') as source:
-            print(json.dumps({'active': BLOCK in source.read()}))
+            hosts = BLOCK in source.read()
+        policies = policy_status()
+        print(json.dumps({'active': hosts and policies, 'hosts': hosts, 'policies': policies}))
         return
     if os.geteuid() != 0:
         raise PermissionError('São necessários privilégios de administrador')
+    if action == 'journal':
+        uid = caller_uid()
+        state = root_json(RESTRICTION_STATE, None)
+        events = root_json(EMERGENCY_JOURNAL, [])
+        print(json.dumps(dict(active=state if state and state['uid'] == uid else None, events=[event for event in events if event['uid'] == uid])))
+        return
+    if action == 'watch':
+        watch_firewall(caller_uid())
+        return
+    if action == 'strict-status':
+        print(json.dumps(strict_status(caller_uid())))
+        return
+    allowed = None
+    payload = None
+    if action in ('apply', 'apply-strict', 'finish', 'interrupt'):
+        body = b'' if sys.stdin.isatty() else sys.stdin.buffer.read(32769)
+        if len(body) > 32768:
+            raise ValueError('Lista permitida demasiado longa.')
+        payload = json.loads(body) if body.strip() else None
+    if action == 'apply-strict':
+        allowed = validate_allowed(payload.get('allowed') if isinstance(payload, dict) else payload)
+    if action in ('apply', 'apply-strict'):
+        uid = caller_uid()
     fd = os.open('/run/cp-coach-hosts.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     with os.fdopen(fd, 'r+') as lock:
         lock_info = os.fstat(lock.fileno())
@@ -55,14 +507,35 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ValueError('Outra operação CP Coach está em curso; tente novamente.') from None
+        if action in ('apply', 'apply-strict'):
+            record_restriction(uid, payload.get('restriction') if isinstance(payload, dict) else None, action == 'apply-strict')
+        elif action in ('finish', 'interrupt'):
+            if not isinstance(payload, dict) or not re.fullmatch('[0-9a-f]{32}', str(payload.get('id', ''))):
+                raise ValueError('Identificador de sessão inválido.')
+            end_restriction('monitor gap or missing block' if action == 'interrupt' else 'normal end', payload['id'], action == 'interrupt')
+            action = 'remove'
+        elif action == 'remove':
+            end_restriction('helper remove')
+        if action == 'refresh':
+            uid = caller_uid()
+            state = load_strict_state()
+            if not state or state['uid'] != uid:
+                raise ValueError('Nenhuma firewall deste utilizador para atualizar.')
+            refresh_strict(uid, validate_allowed(state['allowed']))
+            print(json.dumps(strict_status(uid)))
+            return
         info = os.lstat('/etc/hosts')
         if not stat.S_ISREG(info.st_mode):
             raise ValueError('/etc/hosts não é um ficheiro regular')
         with open('/etc/hosts') as source:
             original = source.read()
+        if action != 'apply-strict':
+            remove_strict()
+        noai = noai_hosts_block() if action == 'apply' else ''
+        change_policies('apply' if action == 'apply-strict' else action, allowed)
         body = stripped(original)
-        if action == 'apply':
-            body = body.rstrip('\n') + '\n' + BLOCK
+        if action in ('apply', 'apply-strict'):
+            body = body.rstrip('\n') + '\n' + BLOCK + noai
         fd, name = tempfile.mkstemp(prefix='.cp-coach-', dir='/etc')
         try:
             with os.fdopen(fd, 'w') as target:
@@ -75,7 +548,12 @@ def main():
         finally:
             if os.path.exists(name):
                 os.unlink(name)
-        print(json.dumps({'active': action == 'apply'}))
+        if action == 'apply-strict':
+            set_strict(uid, allowed, [], [])
+            refresh_strict(uid, allowed)
+            print(json.dumps(strict_status(uid)))
+        else:
+            print(json.dumps({'active': action == 'apply'}))
 
 
 if __name__ == '__main__':
